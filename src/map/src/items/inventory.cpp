@@ -17,10 +17,13 @@
 #include "srv_set_item.h"
 #include "srv_set_money.h"
 #include "srv_craft_enhance_reply.h"
+#include "srv_equip_projectile.h"
+
 
 #include <limits>
 
 using namespace RoseCommon;
+using namespace RoseCommon::Packet;
 using namespace Items;
 
 namespace {
@@ -69,6 +72,14 @@ inline bool is_spot_correct(const EntitySystem& entitySystem, Entity entity, siz
             return pos == EquippedPosition::BACKPACK;
         case ItemType::ITEM_RING:
             return pos == EquippedPosition::RING;
+            switch (item.subtype) {
+                case ItemSubType::RRING:
+                    return pos == EquippedPosition::RING;
+                case ItemSubType::NNECKLACE:
+                    return pos == EquippedPosition::NECKLACE;
+                case ItemSubType::EARRING:
+                    return pos == EquippedPosition::EARING;
+            }
         case ItemType::ITEM_WEAPON_R:
             return pos == EquippedPosition::WEAPON_R;
         case ItemType::ITEM_WEAPON_L:
@@ -94,6 +105,22 @@ inline size_t get_item_tab(ItemType type) {
     else if (type == ItemType::ITEM_ETC || type == ItemType::ITEM_ETC2 || type == ItemType::ITEM_ETC_GEM) return 2;
     else return 3;
     }
+}
+
+bool Items::is_bullet_weapon(const EntitySystem& entitySystem, Entity entity) {
+    const auto& inv = entitySystem.get_component<Component::Inventory>(entity);
+    const auto& weaponInfo = entitySystem.get_component<RoseCommon::ItemDef>(inv.items[EquippedPosition::WEAPON_R]);
+    return ((weaponInfo.subtype >= ItemSubType::BOW && weaponInfo.subtype <= ItemSubType::LAUNCHER) || (weaponInfo.subtype == ItemSubType::XBOW));
+}
+
+Entity Items::get_bullet_slot(const EntitySystem& entitySystem, Entity entity) {
+    const auto& inv = entitySystem.get_component<Component::Inventory>(entity);
+    uint8_t slot = 0;
+    if (inv.items[EquippedPosition::WEAPON_R] != entt::null) {
+        const auto& weaponInfo = entitySystem.get_component<RoseCommon::ItemDef>(inv.items[EquippedPosition::WEAPON_R]);
+        slot = FIRST_BULLET_SLOT + (weaponInfo.subtype % 10 - 1);
+    }
+    return inv.items[slot];
 }
 
 size_t Items::get_first_available_spot(const EntitySystem& entitySystem, Entity entity, Entity item) {
@@ -167,11 +194,15 @@ ReturnValue Items::add_item(EntitySystem& entitySystem, Entity entity, Entity it
     return ReturnValue::OK;
 }
 
-Entity Items::remove_item(EntitySystem& entitySystem, Entity entity, size_t pos, uint32_t quantity) {
+Entity Items::remove_item(EntitySystem& entitySystem, Entity entity, Entity item, uint32_t quantity) {
     auto& inv = entitySystem.get_component<Component::Inventory>(entity);
-    Entity item = inv.items[pos];
     auto& i = entitySystem.get_component<Component::Item>(item);
     const auto& it = entitySystem.get_component<ItemDef>(item);
+    uint8_t pos = 0;
+    for (uint j = 0; j < MAX_ITEMS; j++)
+    {
+        if (inv.items[j] == item) pos = j;
+    }
     if (i.count < quantity) {
         return entt::null;
     }
@@ -210,15 +241,47 @@ void Items::swap_item(EntitySystem& entitySystem, Entity entity, size_t pos1, si
     std::swap(inv.items[pos1], inv.items[pos2]);
 }
 
+void Items::set_projectile(EntitySystem& entitySystem, Entity entity, const RoseCommon::Packet::CliEquipProjectile& packet) {
+    RoseCommon::Packet::CliEquipProjectile::ProjectileTypeAndIndex projectile = packet.get_projectile();
+    uint16_t projType = projectile.get_type();
+    uint16_t from = projectile.get_index();
+    uint16_t to = FIRST_BULLET_SLOT + projType;
+    if (projType >= BulletType::MAX_BULLET_TYPES) {
+        return;
+    } else {
+        const auto& inv = entitySystem.get_component<Component::Inventory>(entity);
+        if (from == 0) { //Unequip the item
+            const auto& item = entitySystem.get_component<Component::Item>(inv.items[to]);
+            if (item.count == 0)  {
+                entitySystem.delete_entity(remove_item(entitySystem, entity, inv.items[from], item.count));
+            } else {
+                unequip_item(entitySystem, entity, to);
+            }
+        } else { //Equip the item
+            if(inv.items[from] != entt::null) {
+                equip_item(entitySystem, entity, from, to);
 
+                const auto& basicInfo = entitySystem.get_component<Component::BasicInfo>(entity);
+                RoseCommon::Packet::SrvEquipProjectile::ProjectileData projectData;
+                projectData.set_type(projType);
+                projectData.set_id(to);
+                auto packet = RoseCommon::Packet::SrvEquipProjectile::create(basicInfo.id, projectData);
+                entitySystem.send_to(entity, packet);
+            }
+        }
+    }
+}
 
 ReturnValue Items::equip_item(EntitySystem& entitySystem, Entity entity, size_t from, size_t to) {
+    auto logger = Core::CLog::GetLogger(Core::log_type::GENERAL).lock();
     const auto& inv = entitySystem.get_component<Component::Inventory>(entity);
 
     if (from < decltype(inv.getInventory())::offset() || from >= decltype(inv.getInventory())::size()) {
+        logger->warn("1");
         return ReturnValue::WRONG_INDEX;
     }
     if (to < decltype(inv.getEquipped())::offset() || (to >= decltype(inv.getEquipped())::size() && to < RidingItem::BODY) || to >= MAX_ITEMS) {
+        logger->warn("2");
         return ReturnValue::WRONG_INDEX;
     }
 
@@ -227,23 +290,29 @@ ReturnValue Items::equip_item(EntitySystem& entitySystem, Entity entity, size_t 
     const auto& item = entitySystem.get_component<RoseCommon::ItemDef>(to_equip);
     if (item.type == ItemType::ITEM_WEAPON_R && (is_two_handed(item.subtype) == true) && (inv.items[EquippedPosition::WEAPON_L] != entt::null))
     {
+        logger->warn("3");
         if (unequip_item(entitySystem, entity, (size_t)EquippedPosition::WEAPON_L) == ReturnValue::NO_SPACE) return ReturnValue::NO_SPACE;
     }
 
     if (!is_spot_correct(entitySystem, to_equip, to)) {
+        logger->warn("4");
         return ReturnValue::REQUIREMENTS_NOT_MET;
     }
     if (equipped != entt::null) {
+        logger->warn("5");
         const auto& lua = entitySystem.get_component<Component::ItemLua>(equipped);
         if (const auto tmp = lua.api.lock(); tmp) {
+            logger->warn("6");
             if (!tmp->on_unequip(entity)) {
                 //return ReturnValue::REQUIREMENTS_NOT_MET;
             }
         }
     }
     if (to_equip != entt::null) {
+        logger->warn("7");
         const auto& lua = entitySystem.get_component<Component::ItemLua>(to_equip);
         if (const auto tmp = lua.api.lock(); tmp) {
+            logger->warn("8");
             if (!tmp->on_equip(entity)) {
                 //return ReturnValue::REQUIREMENTS_NOT_MET;
             }
@@ -252,9 +321,11 @@ ReturnValue Items::equip_item(EntitySystem& entitySystem, Entity entity, size_t 
     swap_item(entitySystem, entity, from, to);
     const auto& basicInfo = entitySystem.get_component<Component::BasicInfo>(entity);
     {
+        logger->warn("9");
         switch (item.type) {
             case ItemType::ITEM_RIDING:
             {
+                logger->warn("10");
                 const auto packet = RoseCommon::Packet::SrvEquipItemRide::create(basicInfo.id, static_cast<RoseCommon::Packet::SrvEquipItemRide::EquippedPositionRide>(to),
                     entitySystem.item_to_equipped<RoseCommon::Packet::SrvEquipItemRide>(inv.items[to]), static_cast<size_t>(800));
                 entitySystem.send_map(packet);
@@ -262,6 +333,7 @@ ReturnValue Items::equip_item(EntitySystem& entitySystem, Entity entity, size_t 
             }
             default:
             {
+                logger->warn("11");
                 const auto packet = RoseCommon::Packet::SrvEquipItem::create(basicInfo.id, to,
                     entitySystem.item_to_equipped<RoseCommon::Packet::SrvEquipItem>(inv.items[to]));
                 entitySystem.send_map(packet);
@@ -291,7 +363,7 @@ void enhance_gemming(EntitySystem & entitySystem, Entity entity, const RoseCommo
         if (item.gemOpt == 0) {
             if (gem.count > 0 && gemDef.type == ItemType::ITEM_ETC_GEM) {
                 // TODO: Success rate random :>
-                remove_item(entitySystem, entity, data.get_gem_source(), 1);
+                remove_item(entitySystem, entity, inv.items[data.get_gem_source()], 1);
                 item.gemOpt = gemDef.id;
                 result_packet.set_result(RoseCommon::Packet::SrvCraftEnhanceReply::CraftEnhancementResult::GEM_SUCCESS);
 
@@ -499,7 +571,7 @@ void Items::drop_item_packet(EntitySystem& entitySystem, Entity entity, const Ro
             return; // we don't have enough zuly to remove
         }
     } else {
-        item = remove_item(entitySystem, entity, index, quantity);
+        item = remove_item(entitySystem, entity, inv.items[index], quantity);
     }
     const auto& pos = entitySystem.get_component<Component::Position>(entity);
     const auto [x, y] = Core::Random::getInstance().random_in_circle(pos.x, pos.y, DROP_RANGE);
